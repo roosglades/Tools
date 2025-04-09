@@ -1,19 +1,19 @@
+import json
+import time
+import logging
+from typing import List, Optional
+from datetime import datetime
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from delta.tables import DeltaTable
 from delta import configure_spark_with_delta_pip
-import time
-import logging
-import os
-from typing import List, Optional
-from datetime import datetime
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # Initialize Spark session with Delta Lake support
-def initialize_spark_delta_lake(app_name="DE Pipeline"):
+def initialize_local_spark_delta_lake(app_name="DE Pipeline"):
     """
     Initialize a Spark session with Delta Lake support for local execution
     
@@ -185,11 +185,12 @@ def create_checkpoint(pipeline_id, layer, version=None, metadata=None):
         "metadata": metadata or {}
     }
     
-    logger.info(f"Checkpoint created: {checkpoint}")
+    logger.info(f"Checkpoint created:\n{json.dumps(checkpoint, indent=2)}")
     return checkpoint
 
 # Process bronze layer
-def process_batch_bronze_layer(spark, source_path, schema, bronze_table_path, pipeline_id, mode='test'):
+def process_batch_bronze_layer(spark, source_path, schema, bronze_path, bronze_transform=None, 
+                                validation_rules=None, pipeline_id='test', mode='test'):
     """
     Process the bronze layer (raw data ingestion)
     
@@ -197,7 +198,9 @@ def process_batch_bronze_layer(spark, source_path, schema, bronze_table_path, pi
     - spark: SparkSession
     - source_path: Path to source CSV file
     - schema: Schema for the source data
-    - bronze_table_path: Path to store bronze layer Delta table
+    - bronze_path: Path to store bronze layer Delta table
+    - bronze_transform: transformation function for the bronze layer
+    - validation_rules: valdiation rules to apply
     - pipeline_id: Unique identifier for this pipeline run
     - mode: 'test' or 'write' mode
     
@@ -208,80 +211,61 @@ def process_batch_bronze_layer(spark, source_path, schema, bronze_table_path, pi
     
     # Read CSV data with schema
     try:
-        raw_df = spark.read.format("csv") \
-            .option("header", "true") \
-            .option("inferSchema", "false") \
-            .schema(schema) \
+        bronzedf = (spark.read.format("csv")
+            .option("header", "true")
+            .option("inferSchema", "false")
+            .schema(schema)
             .load(source_path)
-
-        # Clean any non-timestamp characters first
-        raw_df = raw_df.withColumn(
-            "timestamp_cleaned", 
-            F.regexp_replace(F.col("timestamp"), "[^0-9\\-: ]", "")
         )
 
-        # Use try_cast to handle invalid timestamps gracefully by returning NULL
-        raw_df = raw_df.withColumn(
-            "timestamp",
-            F.expr("try_cast(timestamp_cleaned as timestamp)")
+        # Add metadata columns
+        bronzedf = (bronzedf
+                .withColumn("ingestion_timestamp", F.current_timestamp())
+                .withColumn("source_file", F.input_file_name())
+                .withColumn("batch_id", F.lit(pipeline_id))
         )
 
-        # Rename to transaction_date
-        raw_df = raw_df.withColumnRenamed('timestamp', 'transaction_timestamp')
-
-        # Drop the intermediate column
-        raw_df = raw_df.drop("timestamp_cleaned")
-            
         logger.info(f"Successfully read CSV data from {source_path}")
             
     except Exception as e:
         logger.error(f"Failed to read CSV data: {str(e)}")
         raise
-        
-    # Add metadata columns
-    bronzedf = raw_df \
-        .withColumn("ingestion_timestamp", F.current_timestamp()) \
-        .withColumn("source_file", F.input_file_name()) \
-        .withColumn("batch_id", F.lit(pipeline_id))
     
-    # Define bronze validation rules
-    bronze_validation_rules = [
-        {
-            "name": "has_transaction_id",
-            "condition": "transaction_id IS NOT NULL",
-            "description": "Transaction ID must be present"
-        },
-        {
-            "name": "valid_amount",
-            "condition": "amount IS NULL OR amount > 0",
-            "description": "Amount must be positive if not null"
-        },
-        {
-            "name": "valid_transaction_timestamp",
-            "condition": "transaction_timestamp IS NULL OR transaction_timestamp <= current_date()",
-            "description": "Transaction Timestamp must not be in the future"
-        }
-    ]
+    try:
+        if bronze_transform:
+                bronzedf = bronze_transform(bronzedf)
+                logger.info(f"Transformation function applied")
+            
+        else:
+            logger.warning(f"No transformation function defined")
     
+    except Exception as e:
+        logger.error(f"Failed to apply transformation function")
+        raise
+
     # Write to bronze layer
     try:
         if mode == 'write':
             # Write data to bronze layer
-            bronzedf.write \
-                .format("delta") \
-                .mode("overwrite") \
-                .option("overwriteSchema", "true") \
-                .save(bronze_table_path)
+            (bronzedf.write
+                .format("delta")
+                .mode("overwrite")
+                .option("overwriteSchema", "true")
+                .save(bronze_path)
+            )
             
-            logger.info(f"Successfully wrote data to bronze layer at {bronze_table_path}")
+            logger.info(f"Successfully wrote data to bronze layer at {bronze_path}")
             
             # Get current version
-            delta_table = DeltaTable.forPath(spark, bronze_table_path)
+            delta_table = DeltaTable.forPath(spark, bronze_path)
             current_version = delta_table.history(1).select("version").collect()[0][0]
             
             # Run data quality and validation checks
-            quality_metrics = check_data_quality(bronzedf, "bronze", sample_ratio=0.2)
-            validation_results = validate_dataframe(bronzedf, bronze_validation_rules, sample_ratio=0.2)
+            quality_metrics = check_data_quality(bronzedf, "bronze", sample_ratio=0.1)
+            if validation_rules:
+                validation_results = validate_dataframe(bronzedf, validation_rules, sample_ratio=0.1)
+            else:
+                validation_results = None
             
             # Create checkpoint
             create_checkpoint(pipeline_id, "bronze", current_version, {
@@ -292,11 +276,13 @@ def process_batch_bronze_layer(spark, source_path, schema, bronze_table_path, pi
             })
 
         elif mode == 'test':
-            logger.warning(f"Bronze layer in Test Mode")
+            logger.warning(f"--- Bronze layer in Test Mode ---")
             # Run data quality and validation checks
-            quality_metrics = check_data_quality(bronzedf, "bronze", sample_ratio=0.2)
-            validation_results = validate_dataframe(bronzedf, bronze_validation_rules, sample_ratio=0.2)
-
+            quality_metrics = check_data_quality(bronzedf, "bronze", sample_ratio=0.1)
+            if validation_rules:
+                validation_results = validate_dataframe(bronzedf, validation_rules, sample_ratio=0.1)
+            else:
+                validation_results = None
             current_version = 'test'
 
             # Create checkpoint
@@ -315,10 +301,12 @@ def process_batch_bronze_layer(spark, source_path, schema, bronze_table_path, pi
         raise
     
     logger.info(f"Bronze layer processing completed in {time.time() - start_time:.2f} seconds")
+
     return bronzedf, current_version
 
 # Process silver layer
-def process_batch_silver_layer(spark, bronze_table_path, silver_table_path, pipeline_id, mode='test', bronze_version=None):
+def process_batch_silver_layer(spark, bronze_path, silver_path, silver_transform=None, validation_rules=None,
+                                pipeline_id='test', mode='test', bronze_version=None):
     """
     Process the silver layer (cleansed data)
     
@@ -335,96 +323,71 @@ def process_batch_silver_layer(spark, bronze_table_path, silver_table_path, pipe
     logger.info("Starting silver layer processing")
     start_time = time.time()
     
-    # If bronze_version is provided, read from that specific version
-    if bronze_version:
-        try:
-            bronzedf = spark.read.format("delta") \
-                .option("versionAsOf", bronze_version) \
-                .load(bronze_table_path)
-            logger.info(f"Successfully read bronze data version {bronze_version}")
-        except Exception as e:
-            logger.error(f"Failed to read bronze data: {str(e)}")
-            raise
-    else:
-        # Otherwise, read the latest version
-        try:
-            delta_table = DeltaTable.forPath(spark, bronze_table_path)
-            bronze_version = delta_table.history(1).select("version").collect()[0][0]
-            bronzedf = spark.read.format("delta") \
-                .option("versionAsOf", bronze_version) \
-                .load(bronze_table_path)
-            logger.info(f"Successfully read bronze data version {bronze_version}")
-        except Exception as e:
-            logger.error(f"Failed to read bronze data: {str(e)}")
-            raise
-
-    # Silver layer transformations
     try:
-        # Remove duplicates
-        silverdf = bronzedf.dropDuplicates(subset=["transaction_id"])
+        # If bronze_version is provided, read from that specific version
+        if bronze_version:
+            bronzedf = (spark.read.format("delta")
+                .option("versionAsOf", bronze_version)
+                .load(bronze_path)
+            )
 
-        # Standardize Data
-        silverdf = silverdf \
-            .withColumn("amount", F.abs(F.col("amount"))) \
-            .withColumn("transaction_type", F.lower(F.col("transaction_type"))) \
-            .withColumn("category", F.lower(F.col("category"))) \
-            .withColumn("status", F.lower(F.col("status")))
+            logger.info(f"Successfully read bronze data version {bronze_version}")
 
-        # Filter Data
-        # Address bronze layer data validation check concerns
-        silverdf = silverdf.filter(
-                                    (F.col('transaction_id').isNotNull()) # transaction id must exist
-                                    & (F.col('amount') > 0) # amount must be positive
-                                    & ((F.col('transaction_timestamp') <= F.current_date()) # must be <= current date
-                                    |(F.col('transaction_timestamp').isNull()))) # or must be Null, no future timestamps
+        # Otherwise, read the latest version
+        else:
+            delta_table = DeltaTable.forPath(spark, bronze_path)
+            bronze_version = delta_table.history(1).select("version").collect()[0][0]
+
+            bronzedf = (spark.read.format("delta")
+                .option("versionAsOf", bronze_version)
+                .load(bronze_path)
+            )
+
+            logger.info(f"Successfully read bronze data version {bronze_version}")
+
+    except Exception as e:
+        logger.error(f"Failed to read bronze data: {str(e)}")
+        raise
+    
+    try:
+        if silver_transform:
+
+                silverdf = silver_transform(bronzedf)
+                logger.info(f"Transformation function applied")
+            
+        else:
+            silverdf = bronzedf
+            logger.warning(f"No transformation function defined")
+
+    except Exception as e:
+        logger.error(f"Failed to apply transformation function")
+        raise
         
-        # Split timestamp into date and time
-        silverdf = silverdf \
-            .withColumn("transaction_date", F.to_date("transaction_timestamp")) \
-            .withColumn("transaction_time", F.date_format("transaction_timestamp", "HH:mm:ss"))
-        
-        # Derive year_month for partitioning
-        silverdf = silverdf \
-            .withColumn("year_month", F.date_format(F.col("transaction_date"), "yyyy-MM")) \
-            .withColumn("processing_timestamp", F.current_timestamp())
-        
-        # Define silver validation rules
-        silver_validation_rules = [
-            {
-                "name": "valid_transaction_type",
-                "condition": "transaction_type IN ('debit', 'credit', 'transfer', 'payment', 'withdrawal', 'deposit') OR transaction_type IS NULL",
-                "description": "Transaction type must be one of the valid types"
-            },
-            {
-                "name": "valid_status",
-                "condition": "status IN ('completed', 'pending', 'failed', 'cancelled', 'refunded') OR status IS NULL",
-                "description": "Status must be one of the valid statuses"
-            },
-            {
-                "name": "valid_currency",
-                "condition": "currency IS NULL OR length(currency) = 3",
-                "description": "Currency code should be 3 characters if present"
-            }
-        ]
-        
+    
+    # Silver layer transformations
+    try:        
         if mode == 'write':
             # Write to silver layer
-            silverdf.write \
-                .format("delta") \
-                .mode("overwrite") \
-                .option("overwriteSchema", "true") \
-                .partitionBy("year_month") \
-                .save(silver_table_path)
+            (silverdf.write
+                .format("delta")
+                .mode("overwrite")
+                .option("overwriteSchema", "true")
+                .partitionBy("year_month")
+                .save(silver_path)
+            )
             
-            logger.info(f"Successfully wrote data to silver layer at {silver_table_path}")
+            logger.info(f"Successfully wrote data to silver layer at {silver_path}")
             
             # Get current version
-            delta_table = DeltaTable.forPath(spark, silver_table_path)
+            delta_table = DeltaTable.forPath(spark, silver_path)
             current_version = delta_table.history(1).select("version").collect()[0][0]
             
             # Run data quality and validation checks
-            quality_metrics = check_data_quality(silverdf, "silver", sample_ratio=0.2)
-            validation_results = validate_dataframe(silverdf, silver_validation_rules, sample_ratio=0.2)
+            quality_metrics = check_data_quality(silverdf, "silver", sample_ratio=0.1)
+            if validation_rules:
+                validation_results = validate_dataframe(silverdf, validation_rules, sample_ratio=0.1)
+            else:
+                validation_results = None
             
             # Create checkpoint
             create_checkpoint(pipeline_id, "silver", current_version, {
@@ -436,8 +399,11 @@ def process_batch_silver_layer(spark, bronze_table_path, silver_table_path, pipe
         elif mode == 'test':
             logger.warning(f"--- Silver layer in Test Mode ---")
             # Run data quality and validation checks
-            quality_metrics = check_data_quality(silverdf, "silver", sample_ratio=0.2)
-            validation_results = validate_dataframe(silverdf, silver_validation_rules, sample_ratio=0.2)
+            quality_metrics = check_data_quality(silverdf, "silver", sample_ratio=0.1)
+            if validation_rules:
+                validation_results = validate_dataframe(silverdf, validation_rules, sample_ratio=0.1)
+            else: 
+                validation_results = None
 
             current_version = 'test'
             # Create checkpoint
@@ -455,10 +421,12 @@ def process_batch_silver_layer(spark, bronze_table_path, silver_table_path, pipe
         raise
     
     logger.info(f"Silver layer processing completed in {time.time() - start_time:.2f} seconds")
+
     return silverdf, current_version
 
 # Process gold layer
-def process_batch_gold_layer(spark, silver_table_path, gold_table_path, pipeline_id, mode='test', silver_version=None):
+def process_batch_gold_layer(spark, silver_path, gold_path, gold_transform=None, validation_rules= None, 
+                            pipeline_id='test', mode='test', silver_version=None):
     """
     Process the gold layer (business aggregates)
     
@@ -475,100 +443,52 @@ def process_batch_gold_layer(spark, silver_table_path, gold_table_path, pipeline
     logger.info("Starting gold layer processing")
     start_time = time.time()
     
-    # If silver version is provided, read from that specific version
-    if silver_version:
-        try:
-            silverdf = spark.read.format("delta") \
-                .option("versionAsOf", silver_version) \
-                .load(silver_table_path)
-            logger.info(f"Successfully read silver data version {silver_version}")
-        except Exception as e:
-            logger.error(f"Failed to read silver data: {str(e)}")
-            raise
-    else:
-        # Otherwise, read the latest version
-        try:
-            delta_table = DeltaTable.forPath(spark, silver_table_path)
-            silver_version = delta_table.history(1).select("version").collect()[0][0]
-            silverdf = spark.read.format("delta") \
-                .option("versionAsOf", silver_version) \
-                .load(silver_table_path)
-            logger.info(f"Successfully read silver data version {silver_version}")
-        except Exception as e:
-            logger.error(f"Failed to read silver data: {str(e)}")
-            raise
-    
-    gold_dfs = {}
-    
+
     try:
-        # Gold aggregation 1: Daily summary by category
-        daily_category = silverdf \
-            .groupBy("transaction_date", "category") \
-            .agg(
-                F.count("transaction_id").alias("transaction_count"),
-                F.sum("amount").alias("total_amount"),
-                F.avg("amount").alias("avg_amount"),
-                F.min("amount").alias("min_amount"),
-                F.max("amount").alias("max_amount"),
-                F.countDistinct("customer_id").alias("unique_customers")
-            ) \
-            .withColumn("processing_timestamp", F.current_timestamp())
-        
-        gold_dfs["daily_category"] = daily_category
-        
-        # Gold aggregation 2: Customer summary
-        customer_summary = silverdf \
-            .groupBy("customer_id") \
-            .agg(
-                F.count("transaction_id").alias("transaction_count"),
-                F.sum("amount").alias("total_amount"),
-                F.avg("amount").alias("avg_amount"),
-                F.min("transaction_date").alias("first_transaction_date"),
-                F.max("transaction_date").alias("last_transaction_date"),
-                F.approx_count_distinct("category").alias("category_count")
-            ) \
-            .withColumn("processing_timestamp", F.current_timestamp()) \
-            .withColumn("days_since_last_transaction", 
-                        F.datediff(F.current_date(), F.col("last_transaction_date")))
-        
-        gold_dfs["customer_summary"] = customer_summary
-        
-        # Gold aggregation 3: Transaction type summary
-        transaction_type_summary = silverdf \
-            .groupBy("transaction_type") \
-            .agg(
-                F.count("transaction_id").alias("transaction_count"),
-                F.sum("amount").alias("total_amount"),
-                F.avg("amount").alias("avg_amount")
-            ) \
-            .withColumn("processing_timestamp", F.current_timestamp())
-        
-        gold_dfs["transaction_type_summary"] = transaction_type_summary
-        
-        # Define gold validation rules
-        gold_validation_rules = [
-            {
-                "name": "positive_transaction_counts",
-                "condition": "transaction_count > 0",
-                "description": "Transaction counts should be positive"
-            },
-            {
-                "name": "valid_total_amounts",
-                "condition": "total_amount >= 0",
-                "description": "Total amounts should not be negative"
-            }
-        ]
-        
+        # If silver version is provided, read from that specific version
+        if silver_version:
+            silverdf = (spark.read.format("delta")
+                .option("versionAsOf", silver_version)
+                .load(silver_path)
+            )
+            logger.info(f"Successfully read silver data version {silver_version}")
+
+        else:
+            # Otherwise, read the latest version
+            delta_table = DeltaTable.forPath(spark, silver_path)
+            silver_version = delta_table.history(1).select("version").collect()[0][0]
+
+            silverdf = (spark.read.format("delta")
+                .option("versionAsOf", silver_version)
+                .load(silver_path)
+            )
+            logger.info(f"Successfully read silver data version {silver_version}")
+
+    except Exception as e:
+        logger.error(f"Failed to read silver data: {str(e)}")
+        raise
+
+    try:
+        gold_dfs = gold_transform(silverdf)
+        logger.info(f"Transformation function applied")
+
+    except Exception as e:
+        logger.error(f"Failed to apply transformation function")
+        raise
+    
+    
+    try:        
         if mode == 'write':
             # Write each gold table and validate
             for table_name, df in gold_dfs.items():
-                table_path = f"{gold_table_path}/{table_name}"
+                table_path = f"{gold_path}/{table_name}"
                 
-                df.write \
-                    .format("delta") \
-                    .mode("overwrite") \
-                    .option("overwriteSchema", "true") \
+                (df.write
+                    .format("delta")
+                    .mode("overwrite")
+                    .option("overwriteSchema", "true")
                     .save(table_path)
+                )
                 
                 logger.info(f"Successfully wrote gold table {table_name} to {table_path}")
                 
@@ -577,8 +497,11 @@ def process_batch_gold_layer(spark, silver_table_path, gold_table_path, pipeline
                 current_version = delta_table.history(1).select("version").collect()[0][0]
                 
                 # Run data quality and validation checks
-                quality_metrics = check_data_quality(df, f"gold_{table_name}", sample_ratio=0.5)
-                validation_results = validate_dataframe(df, gold_validation_rules, sample_ratio=0.5)
+                quality_metrics = check_data_quality(df, f"gold_{table_name}", sample_ratio=0.2)
+                if validation_rules:
+                    validation_results = validate_dataframe(df, validation_rules, sample_ratio=0.2)
+                else:
+                    validation_results = None
                 
                 # Create checkpoint
                 create_checkpoint(pipeline_id, f"gold_{table_name}", current_version, {
@@ -590,8 +513,11 @@ def process_batch_gold_layer(spark, silver_table_path, gold_table_path, pipeline
             logger.warning(f"Gold layer in Test Mode")
             for table_name, df in gold_dfs.items():
                 # Run data quality and validation checks
-                quality_metrics = check_data_quality(df, f"gold_{table_name}", sample_ratio=0.5)
-                validation_results = validate_dataframe(df, gold_validation_rules, sample_ratio=0.5)
+                quality_metrics = check_data_quality(df, f"gold_{table_name}", sample_ratio=0.2)
+                if validation_rules:
+                    validation_results = validate_dataframe(df, validation_rules, sample_ratio=0.2)
+                else:
+                    validation_results = None
 
                 current_version = 'test'
                 # Create checkpoint
@@ -602,11 +528,13 @@ def process_batch_gold_layer(spark, silver_table_path, gold_table_path, pipeline
                 })
         else:
             raise ValueError("Mode must = test or write")
+
     except Exception as e:
         logger.error(f"Failed to process gold layer: {str(e)}")
         raise
     
     logger.info(f"Gold layer processing completed in {time.time() - start_time:.2f} seconds")
+
     return gold_dfs
 
 # Optimize tables
@@ -643,7 +571,11 @@ def optimize_table(spark, table_path, zorder_columns: Optional[List[str]] = None
         logger.warning(f"Failed to optimize {table_path}: {str(e)}")
 
 # Run the full data engineering pipeline
-def run_batch_de_pipeline(spark, source_path, bronze_path, bronze_schema, silver_path, gold_path, pipeline_name='DE_Pipeline'):
+def run_batch_de_pipeline(spark, source_path, bronze_schema, 
+                        bronze_path, silver_path, gold_path, 
+                        bronze_transform=None, silver_transform=None, gold_transform=None, 
+                        bronze_validation_rules=None, silver_validation_rules=None, gold_validation_rules=None,
+                        pipeline_name='DE_Pipeline'):
     """
     Run a bronze, silver, gold batch ETL pipeline
     
@@ -675,7 +607,8 @@ def run_batch_de_pipeline(spark, source_path, bronze_path, bronze_schema, silver
         
         # Process Bronze layer
         bronze_start = time.time()
-        bronzedf, bronze_version = process_batch_bronze_layer(spark, source_path, bronze_schema, bronze_path, pipeline_id, 'write')
+        bronzedf, bronze_version = process_batch_bronze_layer(spark, source_path, bronze_schema, bronze_path, 
+                                                            bronze_transform, bronze_validation_rules, pipeline_id, 'write')
         bronze_duration = time.time() - bronze_start
         
         pipeline_metrics["stages"]["bronze"] = {
@@ -698,9 +631,8 @@ def run_batch_de_pipeline(spark, source_path, bronze_path, bronze_schema, silver
         
         # Process Silver layer
         silver_start = time.time()
-        silverdf, silver_version = process_batch_silver_layer(
-            spark, bronze_path, silver_path, pipeline_id, 'write', bronze_version
-        )
+        silverdf, silver_version = process_batch_silver_layer(spark, bronze_path, silver_path, silver_transform, 
+                                                            silver_validation_rules, pipeline_id, 'write', bronze_version)
         silver_duration = time.time() - silver_start
         
         pipeline_metrics["stages"]["silver"] = {
@@ -724,9 +656,8 @@ def run_batch_de_pipeline(spark, source_path, bronze_path, bronze_schema, silver
         
         # Process Gold layer
         gold_start = time.time()
-        gold_dfs = process_batch_gold_layer(
-            spark, silver_path, gold_path, pipeline_id, 'write', silver_version
-        )
+        gold_dfs = process_batch_gold_layer(spark, silver_path, gold_path, gold_transform, 
+                                            gold_validation_rules, pipeline_id, 'write', silver_version)
         gold_duration = time.time() - gold_start
         
         pipeline_metrics["stages"]["gold"] = {
