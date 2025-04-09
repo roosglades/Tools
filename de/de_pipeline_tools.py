@@ -239,20 +239,20 @@ def process_batch_bronze_layer(spark, source_format, source_path, schema, bronze
     except Exception as e:
         logger.error(f"Failed to read {source_format} data: {str(e)}")
         raise
-    
+
+    # Transform Bronze (None is normal)
     try:
         if bronze_transform:
                 bronzedf = bronze_transform(bronzedf)
                 logger.info(f"Transformation function applied")
             
         else:
-            logger.warning(f"No transformation function defined")
+            logger.info(f"No transformation function defined")
     
     except Exception as e:
         logger.error(f"Failed to apply transformation function")
         raise
 
-    # Write to bronze layer
     try:
         if mode == 'write':
             # Write data to bronze layer
@@ -292,9 +292,9 @@ def process_batch_bronze_layer(spark, source_format, source_path, schema, bronze
                 validation_results = validate_dataframe(bronzedf, validation_rules, sample_ratio=0.1)
             else:
                 validation_results = None
-            current_version = 'test'
 
             # Create checkpoint
+            current_version = 'test'
             create_checkpoint(pipeline_id, "bronze", current_version, {
                 "quality_metrics": quality_metrics,
                 "validation_results": validation_results,
@@ -361,6 +361,7 @@ def process_batch_silver_layer(spark, bronze_table, silver_table, silver_transfo
         logger.error(f"Failed to read bronze data: {str(e)}")
         raise
     
+    # Transform Silver
     try:
         if silver_transform:
                 silverdf = silver_transform(bronzedf)
@@ -373,9 +374,7 @@ def process_batch_silver_layer(spark, bronze_table, silver_table, silver_transfo
     except Exception as e:
         logger.error(f"Failed to apply transformation function")
         raise
-        
-    
-    # Silver layer transformations
+
     try:        
         if mode == 'write':
             # Write to silver layer
@@ -416,8 +415,8 @@ def process_batch_silver_layer(spark, bronze_table, silver_table, silver_transfo
             else: 
                 validation_results = None
 
-            current_version = 'test'
             # Create checkpoint
+            current_version = 'test'
             create_checkpoint(pipeline_id, "silver", current_version, {
                 "quality_metrics": quality_metrics,
                 "validation_results": validation_results,
@@ -482,7 +481,8 @@ def process_batch_gold_layer(spark, silver_table, gold_table, gold_transform=Non
     except Exception as e:
         logger.error(f"Failed to read silver data: {str(e)}")
         raise
-
+    
+    # Transform(s) Gold
     try:
         gold_dfs = gold_transform(silverdf)
         logger.info(f"Transformation function applied")
@@ -535,8 +535,8 @@ def process_batch_gold_layer(spark, silver_table, gold_table, gold_transform=Non
                 else:
                     validation_results = None
 
-                current_version = 'test'
                 # Create checkpoint
+                current_version = 'test'
                 create_checkpoint(pipeline_id, f"gold_{table_name}", current_version, {
                     "quality_metrics": quality_metrics,
                     "validation_results": validation_results,
