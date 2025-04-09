@@ -1,9 +1,9 @@
 import json
 import time
 import logging
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from datetime import datetime
-from pyspark.sql import SparkSession
+from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql import functions as F
 from delta.tables import DeltaTable
 from delta import configure_spark_with_delta_pip
@@ -51,7 +51,8 @@ def check_data_quality(df, layer_name, sample_ratio=0.1, limit_sample_size=1000)
     - sample_ratio: Fraction of data to sample (0.0 to 1.0)
     - limit_sample_size: Max sample size
     
-    Returns: Dictionary with quality metrics
+    Returns:
+    - Dict: Dictionary with quality metrics including null percentages and column stats
     """
     logger.info(f"Running data quality checks for {layer_name} layer")
     
@@ -116,7 +117,8 @@ def validate_dataframe(df, validation_rules, sample_ratio=0.1, limit_sample_size
     - sample_ratio: Fraction of data to sample
     - limit_sample_size: Max sample size
     
-    Returns: Dictionary with validation results
+    Returns:
+    - Dict: Dictionary with validation results including pass/fail status for each rule
     """
     logger.info(f"Validating dataframe with {len(validation_rules)} rules")
     
@@ -179,7 +181,8 @@ def create_checkpoint(pipeline_id, layer, version=None, metadata=None):
     - version: Delta table version
     - metadata: Additional metadata to store
     
-    Returns: Dictionary with checkpoint information
+    Returns:
+    - Dict: Dictionary with checkpoint information
     """
     checkpoint = {
         "pipeline_id": pipeline_id,
@@ -200,21 +203,22 @@ def process_batch_bronze_layer(spark, source_format, source_path, schema, bronze
     
     Parameters:
     - spark: SparkSession
-    - source_format: format of source data
+    - source_format: Format of source data (e.g., 'csv', 'json', 'parquet','delta')
     - source_path: Path to source data
     - schema: Schema for the source data
-    - bronze_table: Path to store bronze layer Delta table
-    - bronze_transform: transformation function for the bronze layer
-    - validation_rules: valdiation rules to apply
+    - bronze_table: Name for the bronze layer Delta table
+    - bronze_transform: Function to transform the bronze DataFrame (takes DataFrame, returns DataFrame)
+    - validation_rules: List of validation rules to apply
     - pipeline_id: Unique identifier for this pipeline run
     - mode: 'test' or 'write' mode
     
-    Returns: Tuple of (bronzedf, version)
+    Returns:
+    - Tuple: (DataFrame, version) - Bronze DataFrame and its version
     """
     logger.info(f"Starting bronze layer processing for {source_path}")
     start_time = time.time()
     
-    # Read CSV data with schema
+    # Read data with schema
     try:
         bronzedf = (spark.read.format(source_format)
             .option("header", "true")
@@ -233,7 +237,7 @@ def process_batch_bronze_layer(spark, source_format, source_path, schema, bronze
         logger.info(f"Successfully read {source_format.upper()} data from {source_path}")
             
     except Exception as e:
-        logger.error(f"Failed to read CSV data: {str(e)}")
+        logger.error(f"Failed to read {source_format} data: {str(e)}")
         raise
     
     try:
@@ -317,13 +321,16 @@ def process_batch_silver_layer(spark, bronze_table, silver_table, silver_transfo
     
     Parameters:
     - spark: SparkSession
-    - bronze_table_path: Path to bronze layer Delta table
-    - silver_table_path: Path to store silver layer Delta table
+    - bronze_table: Name of bronze layer Delta table
+    - silver_table: Name for the silver layer Delta table
+    - silver_transform: Function to transform the silver DataFrame (takes DataFrame, returns DataFrame)
+    - validation_rules: List of validation rules to apply
     - pipeline_id: Unique identifier for this pipeline run
     - mode: 'test' or 'write' mode
-    - bronze_version: Version of bronze data to use
+    - bronze_version: Version of bronze data to use (None for latest)
     
-    Returns: Tuple of (silverdf, version)
+    Returns:
+    - Tuple: (DataFrame, version) - Silver DataFrame and its version
     """
     logger.info("Starting silver layer processing")
     start_time = time.time()
@@ -356,7 +363,6 @@ def process_batch_silver_layer(spark, bronze_table, silver_table, silver_transfo
     
     try:
         if silver_transform:
-
                 silverdf = silver_transform(bronzedf)
                 logger.info(f"Transformation function applied")
             
@@ -430,20 +436,24 @@ def process_batch_silver_layer(spark, bronze_table, silver_table, silver_transfo
     return silverdf, current_version
 
 # Process gold layer
-def process_batch_gold_layer(spark, silver_table, gold_table, gold_transform=None, validation_rules= None, 
+def process_batch_gold_layer(spark, silver_table, gold_table, gold_transform=None, validation_rules=None, 
                             pipeline_id='test', mode='test', silver_version=None):
     """
     Process the gold layer (business aggregates)
     
     Parameters:
     - spark: SparkSession
-    - silver_table:  Silver layer Delta table
-    - gold_table: Table prefix to store gold layeys
+    - silver_table: Name of silver layer Delta table
+    - gold_table: Table prefix to store gold layer tables
+    - gold_transform: Function that transforms silver DataFrame into multiple gold DataFrames 
+                     (takes DataFrame, returns Dict of DataFrames)
+    - validation_rules: List of validation rules to apply
     - pipeline_id: Unique identifier for this pipeline run
     - mode: 'test' or 'write' mode
-    - silver_version: Version of silver data to use
+    - silver_version: Version of silver data to use (None for latest)
     
-    Returns: Dictionary of gold DataFrames
+    Returns:
+    - Dict: Dictionary of gold DataFrames with table names as keys
     """
     logger.info("Starting gold layer processing")
     start_time = time.time()
@@ -527,13 +537,13 @@ def process_batch_gold_layer(spark, silver_table, gold_table, gold_transform=Non
 
                 current_version = 'test'
                 # Create checkpoint
-                create_checkpoint(pipeline_id, f"gold_{full_table_name}", current_version, {
+                create_checkpoint(pipeline_id, f"gold_{table_name}", current_version, {
                     "quality_metrics": quality_metrics,
                     "validation_results": validation_results,
                     "source_silver_version": silver_version
                 })
         else:
-            raise ValueError("Mode must = test or write")
+            raise ValueError("Mode must = 'test' or 'write'")
 
     except Exception as e:
         logger.error(f"Failed to process gold layer: {str(e)}")
@@ -550,7 +560,7 @@ def optimize_table(spark, table, zorder_columns: Optional[List[str]] = None):
     
     Parameters:
     - spark: SparkSession
-    - table_path: Path to Delta table
+    - table: Name of Delta table to optimize
     - zorder_columns: Optional list of columns to Z-ORDER by
     """
     logger.info("Starting table optimization")
@@ -587,14 +597,22 @@ def run_batch_de_pipeline(spark, source_format, source_path,
     
     Parameters:
     - spark: SparkSession
+    - source_format: Format of source data (e.g., 'csv', 'json', 'parquet')
     - source_path: Path to source data
-    - bronze_table: Table to store bronze layer
     - bronze_schema: Schema for the source data
-    - silver_table: Table to store silver layer
-    - gold_table: Table prefix to store gold layer(s)
+    - bronze_table: Name for the bronze layer Delta table
+    - silver_table: Name for the silver layer Delta table
+    - gold_table: Table prefix for gold layer tables
+    - bronze_transform: Function to transform bronze DataFrame (takes DataFrame, returns DataFrame)
+    - silver_transform: Function to transform silver DataFrame (takes DataFrame, returns DataFrame)
+    - gold_transform: Function to create gold DataFrames (takes DataFrame, returns Dict of DataFrames)
+    - bronze_validation_rules: Validation rules for bronze layer
+    - silver_validation_rules: Validation rules for silver layer
+    - gold_validation_rules: Validation rules for gold layer
     - pipeline_name: Name prefix for the pipeline
     
-    Returns: Dictionary with pipeline results
+    Returns:
+    - Dict: Dictionary with pipeline results and metrics
     """
     start_time = time.time()
     
