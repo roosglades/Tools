@@ -53,11 +53,10 @@ def check_data_quality(df, layer_name, sample_ratio=0.1, limit_sample_size=1000)
     
     # Take a sample with replacement=False to avoid duplicate rows
     sample_df = df.sample(withReplacement=False, fraction=sample_ratio, seed=42) \
-                 .limit(limit_sample_size) \
-                 .cache()
+                 .limit(limit_sample_size).cache()
     
-    # Force action to materialize the sample
-    sample_df.count()
+    # Get sample size
+    sample_size = sample_df.count()
     
     # Get column info
     columns = df.columns
@@ -66,9 +65,6 @@ def check_data_quality(df, layer_name, sample_ratio=0.1, limit_sample_size=1000)
     # Collect null statistics in a single pass
     null_counts_expr = [F.sum(F.when(F.col(c).isNull(), 1).otherwise(0)).alias(c) for c in columns]
     null_stats = sample_df.select(null_counts_expr).first()
-    
-    # Calculate sample size (more accurate than estimation)
-    sample_size = sample_df.count()
     
     # Calculate null percentages
     null_percentages = {col: (null_stats[idx] / sample_size) * 100 if sample_size > 0 else 0 
@@ -125,8 +121,8 @@ def validate_dataframe(df, validation_rules, sample_ratio=0.1, limit_sample_size
                   .limit(limit_sample_size) \
                   .cache()
     
-    # Force action to materialize the sample
-    sample_df.count()
+    # Get sample size
+    sample_size = sample_df.count()
     
     validation_results = {}
     
@@ -144,7 +140,6 @@ def validate_dataframe(df, validation_rules, sample_ratio=0.1, limit_sample_size
         failing_count = sample_df.filter(~F.expr(condition)).count()
         
         # Calculate percentage
-        sample_size = sample_df.count()
         failing_percentage = (failing_count / sample_size) * 100 if sample_size > 0 else 0
         
         validation_results[rule_name] = {
