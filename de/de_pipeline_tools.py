@@ -1,11 +1,13 @@
 import json
 import time
 import logging
-from typing import List, Optional, Dict, Any
 from datetime import datetime
+from typing import List, Optional, Dict, Any
+
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql import functions as F
 from pyspark.sql import Window
+
 from delta.tables import DeltaTable
 from delta import configure_spark_with_delta_pip
 
@@ -28,15 +30,17 @@ def initialize_local_spark_delta_lake(app_name="DE Pipeline"):
     # Build a Spark session with Delta Lake extensions and local configuration
     builder = (SparkSession.builder
         .appName(app_name)
-        .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
-        .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
+        .config("spark.sql.extensions",
+                    "io.delta.sql.DeltaSparkSessionExtension")
+        .config("spark.sql.catalog.spark_catalog",
+                    "org.apache.spark.sql.delta.catalog.DeltaCatalog")
         .config("spark.databricks.delta.schema.autoMerge.enabled", "true")
         .config("spark.sql.catalogImplementation", "hive")
         .config("spark.sql.warehouse.dir", "C:/hive-warehouse")
         .enableHiveSupport()
         .master("local[*]")  # Uses all available cores on local machine
     )
-    
+
     logger.info("---Spark session initialized with Delta Lake support---")
 
     # This helper function adds the Delta Lake JAR packages to the Spark classpath
@@ -57,14 +61,14 @@ def check_data_quality(df, layer_name, sample_ratio=0.1, limit_sample_size=1000)
     Returns:
     - Dict: Dictionary with quality metrics including null percentages and column stats
     """
-    logger.info(f"Running data quality checks for {layer_name} layer")
+    logger.info("Running data quality checks for %s layer", layer_name)
 
     # Get approximate row count with timeout and confidence interval
     approx_row_count = df.rdd.countApprox(timeout=100, confidence=0.95)
 
     # Format schema for pretty logging
     schema_str = df._jdf.schema().treeString()
-    
+
     # Get column info
     columns = df.columns
     column_count = len(columns)
@@ -76,24 +80,24 @@ def check_data_quality(df, layer_name, sample_ratio=0.1, limit_sample_size=1000)
     # Cache the sample to avoid recomputation
     sample_df = df.sample(withReplacement=False, fraction=sample_ratio, seed=42) \
                  .limit(limit_sample_size).cache()
-    
+
     # Get sample size
     sample_size = sample_df.count()
-    
+
     # Collect null statistics in a single pass using list comprehension
     null_counts_expr = [F.sum(F.when(F.col(c).isNull(), 1).otherwise(0)).alias(c) for c in columns]
     null_stats = sample_df.select(null_counts_expr).first()
-    
+
     # Calculate null percentages for each column
-    null_percentages = {col: (null_stats[idx] / sample_size) * 100 if sample_size > 0 else 0 
+    null_percentages = {col: (null_stats[idx] / sample_size) * 100 if sample_size > 0 else 0
                        for idx, col in enumerate(columns)}
-    
+
     # Find columns with high null percentages (>5%)
     high_null_cols = {col: pct for col, pct in null_percentages.items() if pct > 5}
-    
+
     # Clean up cached data to free memory
     sample_df.unpersist()
-    
+
     # Build metrics dictionary with all collected information
     quality_metrics = {
         "layer": layer_name,
@@ -105,17 +109,17 @@ def check_data_quality(df, layer_name, sample_ratio=0.1, limit_sample_size=1000)
         "sample_ratio": sample_ratio,
         "timestamp": datetime.now().isoformat()
     }
-    
+
     # Log key metrics
-    logger.info(f"Data Quality Metrics for {layer_name} layer:")
-    logger.info(f"  - Shape: {shape}")
-    logger.info(f"  - Schema: \n{schema_str}")
-    logger.info(f"  - Sample size: {sample_size}")
-    
+    logger.info("Data Quality Metrics for %s layer:", layer_name)
+    logger.info("  - Shape: %s", shape)
+    logger.info("  - Schema: \n%s", schema_str)
+    logger.info("  - Sample size: %d", sample_size)
+
     # Log warning for columns with high null percentages
     if high_null_cols:
-        logger.warning(f"  - Columns with high null percentages: {high_null_cols}")
-    
+        logger.warning("  - Columns with high null percentages: %s", high_null_cols)
+
     return quality_metrics
 
 # Generic validation function that can be used for any layer
@@ -135,35 +139,35 @@ def validate_dataframe(df, validation_rules, sample_ratio=0.1, limit_sample_size
     Returns:
     - Dict: Dictionary with validation results including pass/fail status for each rule
     """
-    logger.info(f"Validating dataframe with {len(validation_rules)} rules")
-    
+    logger.info("Validating dataframe with %d rules", len(validation_rules))
+
     # Sample the dataframe and cache it to avoid recomputation
     sample_df = df.sample(withReplacement=False, fraction=sample_ratio, seed=42) \
                   .limit(limit_sample_size) \
                   .cache()
-    
+
     # Get sample size
     sample_size = sample_df.count()
-    
+
     validation_results = {}
-    
+
     # Run each validation rule
     for rule in validation_rules:
         rule_name = rule.get("name", "unnamed_rule")
         condition = rule.get("condition")
         description = rule.get("description", "")
-        
+
         # Skip rules without conditions
         if not condition:
-            logger.warning(f"Skipping rule {rule_name} - no condition provided")
+            logger.warning("Skipping rule %s - no condition provided", rule_name)
             continue
-        
+
         # Count records failing the condition (using negation of the condition)
         failing_count = sample_df.filter(~F.expr(condition)).count()
-        
+
         # Calculate percentage of failing records
         failing_percentage = (failing_count / sample_size) * 100 if sample_size > 0 else 0
-        
+
         # Store the validation results
         validation_results[rule_name] = {
             "description": description,
@@ -171,14 +175,15 @@ def validate_dataframe(df, validation_rules, sample_ratio=0.1, limit_sample_size
             "failing_percentage": failing_percentage,
             "passed": failing_count == 0
         }
-        
+
         # Log the result
         status = "PASSED" if failing_count == 0 else "FAILED"
-        logger.info(f"Validation rule '{rule_name}' {status} - {failing_count} records ({failing_percentage:.2f}%) failed")
-    
+        logger.info("Validation rule '%s' %s - %d records (%.2f%%) failed",
+                   rule_name, status, failing_count, failing_percentage)
+
     # Clean up cached data to free memory
     sample_df.unpersist()
-    
+
     # Return comprehensive validation report
     return {
         "validation_results": validation_results,
@@ -210,15 +215,15 @@ def create_checkpoint(pipeline_id, layer, version=None, metadata=None):
         "timestamp": datetime.now().isoformat(),
         "metadata": metadata or {}  # Use empty dict if metadata is None
     }
-    
+
     # Log the checkpoint for monitoring
-    logger.info(f"Checkpoint created:\n{json.dumps(checkpoint, indent=2)}")
+    logger.info("Checkpoint created:\n%s", json.dumps(checkpoint, indent=2))
     return checkpoint
 
 # Process bronze layer
 def process_batch_bronze_layer(spark, source_format, source_path, schema,
-                                bronze_table, bronze_transform=None, validation_rules=None,
-                                pipeline_id='test', mode='test', bronze_writer=None):
+                               bronze_table, bronze_transform=None, validation_rules=None,
+                               pipeline_id='test', mode='test', bronze_writer=None):
     """
     Process the bronze layer (raw data ingestion)
     
@@ -228,7 +233,8 @@ def process_batch_bronze_layer(spark, source_format, source_path, schema,
     - source_path: Path to source data
     - schema: Schema for the source data
     - bronze_table: Name for the bronze layer Delta table
-    - bronze_transform: Function to transform the bronze DataFrame (takes DataFrame, returns DataFrame)
+    - bronze_transform: 
+        Function to transform the bronze DataFrame (takes DataFrame, returns DataFrame)
     - validation_rules: List of validation rules to apply
     - pipeline_id: Unique identifier for this pipeline run
     - mode: 'test' or 'write' mode
@@ -238,7 +244,7 @@ def process_batch_bronze_layer(spark, source_format, source_path, schema,
     """
     logger.info("Starting bronze layer processing")
     start_time = time.time()
-    
+
     # Read data with schema
     try:
         # Read the source data with specified schema and options
@@ -259,33 +265,33 @@ def process_batch_bronze_layer(spark, source_format, source_path, schema,
         # Log successful data read with source path details
         if isinstance(source_path, list):
             paths_str = "\n  - " + "\n  - ".join(source_path)
-            logger.info(f"Successfully read {source_format.upper()} data from: {paths_str}")
+            logger.info("Successfully read %s data from: %s", source_format.upper(), paths_str)
         else:
-            logger.info(f"Successfully read {source_format.upper()} data from: \n{source_path}")
-            
+            logger.info("Successfully read %s data from: \n%s", source_format.upper(), source_path)
+
     except Exception as e:
-        logger.error(f"Failed to read {source_format} data: {str(e)}")
+        logger.error("Failed to read %s data: %s", source_format, str(e))
         raise
 
     # Transform Bronze (None is normal)
     try:
         # Apply transformation if provided
         if bronze_transform:
-                bronzedf = bronze_transform(bronzedf)
-                logger.info(f"Transformation function applied")
-            
+            bronzedf = bronze_transform(bronzedf)
+            logger.info("Transformation function applied")
+
         else:
-            logger.info(f"No transformation function defined")
-    
+            logger.info("No transformation function defined")
+
     except Exception as e:
-        logger.error(f"Failed to apply transformation function")
+        logger.error("Failed to apply transformation function: %s", str(e))
         raise
 
     try:
         # Handle write mode - actual data persistence
         if mode == 'write':
 
-            logger.info(f"Writing to bronze table: {bronze_table}")
+            logger.info("Writing to bronze table: %s", bronze_table)
 
             try:
                 # Get version before any changes to track delta
@@ -295,8 +301,8 @@ def process_batch_bronze_layer(spark, source_format, source_path, schema,
                                     .limit(1) \
                                     .collect()
                 pre_version = pre_versions[0]["version"] if pre_versions else -1
-            
-            except:
+
+            except FileNotFoundError:
                 pre_version = -1  # Table may not exist yet
 
             # Execute defined bronze writer function if provided
@@ -313,25 +319,26 @@ def process_batch_bronze_layer(spark, source_format, source_path, schema,
 
             # Extract operationMetrics as list of dicts
             metrics = [row["operationMetrics"] for row in post_metrics]
-            
+
             # Log write success and metrics
             if metrics:
-                logger.info(f"Successfully wrote to bronze table: {bronze_table}")
-                logger.info(f"Write Metrics: \n{json.dumps(metrics, indent=2)}")
-            else: 
-                logger.info(f"Nothing written to bronze table: {bronze_table}")
-            
+                logger.info("Successfully wrote to bronze table: %s", bronze_table)
+                logger.info("Write Metrics: \n%s", json.dumps(metrics, indent=2))
+            else:
+                logger.info("Nothing written to bronze table: %s", bronze_table)
+
             # Get current version
             delta_table = DeltaTable.forName(spark, bronze_table)
             current_version = delta_table.history(1).select("version").collect()[0][0]
-            
+
             # Run data quality and validation checks
             quality_metrics = check_data_quality(bronzedf, "bronze", sample_ratio=0.1)
             if validation_rules:
-                validation_results = validate_dataframe(bronzedf, validation_rules, sample_ratio=0.1)
+                validation_results = validate_dataframe(bronzedf, validation_rules,
+                                                        sample_ratio=0.1)
             else:
                 validation_results = None
-            
+
             # Create checkpoint to record progress
             create_checkpoint(pipeline_id, "bronze", current_version, {
                 "quality_metrics": quality_metrics,
@@ -342,11 +349,12 @@ def process_batch_bronze_layer(spark, source_format, source_path, schema,
 
         # Handle test mode - no data persistence
         elif mode == 'test':
-            logger.warning(f"--- Bronze layer in Test Mode ---")
+            logger.warning("--- Bronze layer in Test Mode ---")
             # Run data quality and validation checks only
             quality_metrics = check_data_quality(bronzedf, "bronze", sample_ratio=0.1)
             if validation_rules:
-                validation_results = validate_dataframe(bronzedf, validation_rules, sample_ratio=0.1)
+                validation_results = validate_dataframe(bronzedf, validation_rules,
+                                                        sample_ratio=0.1)
             else:
                 validation_results = None
 
@@ -361,19 +369,19 @@ def process_batch_bronze_layer(spark, source_format, source_path, schema,
 
         else:
             raise ValueError("Mode must == 'test' or 'write'")
-        
+
     except Exception as e:
-        logger.error(f"Failed to write to bronze layer: {str(e)}")
+        logger.error("Failed to write to bronze layer: %s", str(e))
         raise
-    
-    logger.info(f"Bronze layer processing completed in {time.time() - start_time:.2f} seconds")
+
+    logger.info("Bronze layer processing completed in %.2f seconds", time.time() - start_time)
 
     return bronzedf, current_version
 
 # Process silver layer
-def process_batch_silver_layer(spark, bronze_table, bronze_version=None, 
-                                silver_table=None, silver_transform=None, validation_rules=None,
-                                pipeline_id='test', mode='test', silver_writer=None):
+def process_batch_silver_layer(spark, bronze_table, bronze_version=None,
+                              silver_table=None, silver_transform=None, validation_rules=None,
+                              pipeline_id='test', mode='test', silver_writer=None):
     """
     Process the silver layer (cleansed data)
     
@@ -381,7 +389,8 @@ def process_batch_silver_layer(spark, bronze_table, bronze_version=None,
     - spark: SparkSession
     - bronze_table: Name of bronze layer Delta table
     - silver_table: Name for the silver layer Delta table
-    - silver_transform: Function to transform the silver DataFrame (takes DataFrame, returns DataFrame)
+    - silver_transform: 
+        Function to transform the silver DataFrame (takes DataFrame, returns DataFrame)
     - validation_rules: List of validation rules to apply
     - pipeline_id: Unique identifier for this pipeline run
     - mode: 'test' or 'write' mode
@@ -392,7 +401,7 @@ def process_batch_silver_layer(spark, bronze_table, bronze_version=None,
     """
     logger.info("Starting silver layer processing")
     start_time = time.time()
-    
+
     try:
         # Read from specific bronze version if provided
         if bronze_version:
@@ -401,7 +410,7 @@ def process_batch_silver_layer(spark, bronze_table, bronze_version=None,
                 .table(bronze_table)
             )
 
-            logger.info(f"Successfully read bronze data version {bronze_version}")
+            logger.info("Successfully read bronze data version %s", bronze_version)
 
         # Otherwise, read the latest version and get its version number
         else:
@@ -413,42 +422,42 @@ def process_batch_silver_layer(spark, bronze_table, bronze_version=None,
                 .table(bronze_table)
             )
 
-            logger.info(f"Successfully read bronze data version {bronze_version}")
+            logger.info("Successfully read bronze data version %s", bronze_version)
 
     except Exception as e:
-        logger.error(f"Failed to read bronze data: {str(e)}")
+        logger.error("Failed to read bronze data: %s", str(e))
         raise
-    
+
     # Transform Silver
     try:
         # Apply silver transformation if provided
         if silver_transform:
-                silverdf = silver_transform(bronzedf)
-                logger.info(f"Transformation function applied")
-            
+            silverdf = silver_transform(bronzedf)
+            logger.info("Transformation function applied")
+
         else:
             silverdf = bronzedf  # Use bronze data as-is
-            logger.warning(f"No transformation function defined")
+            logger.warning("No transformation function defined")
 
     except Exception as e:
-        logger.error(f"Failed to apply transformation function")
+        logger.error("Failed to apply transformation function: %s", str(e))
         raise
 
-    try:        
+    try:
         # Handle write mode - actual data persistence
         if mode == 'write':
-            logger.info(f"Writing to silver table: {silver_table}")
+            logger.info("Writing to silver table: %s", silver_table)
 
             try:
                 # Get version before any changes to track delta
                 pre_versions = spark.sql(f"DESCRIBE HISTORY {silver_table}") \
-                                    .select("version") \
-                                    .orderBy("version", ascending=False) \
-                                    .limit(1) \
-                                    .collect()
+                                   .select("version") \
+                                   .orderBy("version", ascending=False) \
+                                   .limit(1) \
+                                   .collect()
                 pre_version = pre_versions[0]["version"] if pre_versions else -1
-            
-            except:
+
+            except FileNotFoundError:
                 pre_version = -1  # Table may not exist yet
 
             # Write to silver layer
@@ -468,22 +477,23 @@ def process_batch_silver_layer(spark, bronze_table, bronze_version=None,
 
             # Log write success and metrics
             if metrics:
-                logger.info(f"Successfully wrote to silver table: {silver_table}")
-                logger.info(f"Write Metrics: \n{json.dumps(metrics, indent=2)}")
-            else: 
-                logger.info(f"Nothing written to silver table: {silver_table}")
-            
+                logger.info("Successfully wrote to silver table: %s", silver_table)
+                logger.info("Write Metrics: \n%s", json.dumps(metrics, indent=2))
+            else:
+                logger.info("Nothing written to silver table: %s", silver_table)
+
             # Get current version
             delta_table = DeltaTable.forName(spark, silver_table)
             current_version = delta_table.history(1).select("version").collect()[0][0]
-            
+
             # Run data quality and validation checks
             quality_metrics = check_data_quality(silverdf, "silver", sample_ratio=0.1)
             if validation_rules:
-                validation_results = validate_dataframe(silverdf, validation_rules, sample_ratio=0.1)
+                validation_results = validate_dataframe(silverdf, validation_rules,
+                                                        sample_ratio=0.1)
             else:
                 validation_results = None
-            
+
             # Create checkpoint to record progress
             create_checkpoint(pipeline_id, "silver", current_version, {
                 "quality_metrics": quality_metrics,
@@ -491,15 +501,16 @@ def process_batch_silver_layer(spark, bronze_table, bronze_version=None,
                 "source_bronze_version": bronze_version,
                 "duration_seconds": time.time() - start_time
             })
-            
+
         # Handle test mode - no data persistence
         elif mode == 'test':
-            logger.warning(f"--- Silver layer in Test Mode ---")
+            logger.warning("--- Silver layer in Test Mode ---")
             # Run data quality and validation checks only
             quality_metrics = check_data_quality(silverdf, "silver", sample_ratio=0.1)
             if validation_rules:
-                validation_results = validate_dataframe(silverdf, validation_rules, sample_ratio=0.1)
-            else: 
+                validation_results = validate_dataframe(silverdf, validation_rules,
+                                                        sample_ratio=0.1)
+            else:
                 validation_results = None
 
             # Create checkpoint with test version
@@ -512,19 +523,19 @@ def process_batch_silver_layer(spark, bronze_table, bronze_version=None,
             })
         else:
             raise ValueError("Mode must == 'test' or 'write'")
-        
+
     except Exception as e:
-        logger.error(f"Failed to process silver layer: {str(e)}")
+        logger.error("Failed to process silver layer: %s", str(e))
         raise
-    
-    logger.info(f"Silver layer processing completed in {time.time() - start_time:.2f} seconds")
+
+    logger.info("Silver layer processing completed in %.2f seconds", time.time() - start_time)
 
     return silverdf, current_version
 
 # Process gold layer
-def process_batch_gold_layer(spark, silver_table, silver_version=None, 
-                            gold_table=None, gold_transform=None, validation_rules=None, 
-                            pipeline_id='test', mode='test', gold_writer=None):
+def process_batch_gold_layer(spark, silver_table, silver_version=None,
+                           gold_table=None, gold_transform=None, validation_rules=None,
+                           pipeline_id='test', mode='test', gold_writer=None):
     """
     Process the gold layer (business aggregates)
     
@@ -544,7 +555,6 @@ def process_batch_gold_layer(spark, silver_table, silver_version=None,
     """
     logger.info("Starting gold layer processing")
     start_time = time.time()
-    
 
     try:
         # Read from specific silver version if provided
@@ -553,7 +563,7 @@ def process_batch_gold_layer(spark, silver_table, silver_version=None,
                 .option("versionAsOf", silver_version)
                 .table(silver_table)
             )
-            logger.info(f"Successfully read silver data version {silver_version}")
+            logger.info("Successfully read silver data version %s", silver_version)
 
         else:
             # Otherwise, read the latest version and get its version number
@@ -564,41 +574,40 @@ def process_batch_gold_layer(spark, silver_table, silver_version=None,
                 .option("versionAsOf", silver_version)
                 .table(silver_table)
             )
-            logger.info(f"Successfully read silver data version {silver_version}")
+            logger.info("Successfully read silver data version %s", silver_version)
 
     except Exception as e:
-        logger.error(f"Failed to read silver data: {str(e)}")
+        logger.error("Failed to read silver data: %s", str(e))
         raise
-    
+
     # Transform(s) Gold - creates multiple tables
     try:
         gold_dfs = gold_transform(silverdf)
-        logger.info(f"Transformation function applied")
+        logger.info("Transformation function applied")
 
     except Exception as e:
-        logger.error(f"Failed to apply transformation function")
+        logger.error("Failed to apply transformation function: %s", str(e))
         raise
-    
-    
-    try:        
+
+    try:
         # Handle write mode - actual data persistence
         if mode == 'write':
             # Write each gold table and validate
             for table_name, df in gold_dfs.items():
                 full_table_name = f"{gold_table}_{table_name}"
 
-                logger.info(f"Writing to gold table: {full_table_name}")
+                logger.info("Writing to gold table: %s", full_table_name)
 
                 try:
                     # Get version before any changes to track delta
                     pre_versions = spark.sql(f"DESCRIBE HISTORY {full_table_name}") \
-                                        .select("version") \
-                                        .orderBy("version", ascending=False) \
-                                        .limit(1) \
-                                        .collect()
+                                      .select("version") \
+                                      .orderBy("version", ascending=False) \
+                                      .limit(1) \
+                                      .collect()
                     pre_version = pre_versions[0]["version"] if pre_versions else -1
 
-                except:
+                except FileNotFoundError:
                     pre_version = -1  # Table may not exist yet
 
                 # Write to gold table
@@ -615,35 +624,35 @@ def process_batch_gold_layer(spark, silver_table, silver_version=None,
 
                 # Extract operationMetrics as list of dicts
                 metrics = [row["operationMetrics"] for row in post_metrics]
-                
+
                 # Log write success and metrics
                 if metrics:
-                    logger.info(f"Successfully wrote to gold table: {full_table_name}")
-                    logger.info(f"Write Metrics: \n{json.dumps(metrics, indent=2)}")
-                else: 
-                    logger.info(f"Nothing written to gold table: {full_table_name}")
-                
+                    logger.info("Successfully wrote to gold table: %s", full_table_name)
+                    logger.info("Write Metrics: \n%s", json.dumps(metrics, indent=2))
+                else:
+                    logger.info("Nothing written to gold table: %s", full_table_name)
+
                 # Get current version
                 delta_table = DeltaTable.forName(spark, full_table_name)
                 current_version = delta_table.history(1).select("version").collect()[0][0]
-                
+
                 # Run data quality and validation checks with higher sampling ratio
                 quality_metrics = check_data_quality(df, f"{full_table_name}", sample_ratio=0.2)
                 if validation_rules:
                     validation_results = validate_dataframe(df, validation_rules, sample_ratio=0.2)
                 else:
                     validation_results = None
-                
+
                 # Create checkpoint to record progress
                 create_checkpoint(pipeline_id, f"gold_{table_name}", current_version, {
                     "quality_metrics": quality_metrics,
                     "validation_results": validation_results,
                     "source_silver_version": silver_version
                 })
-                
+
         # Handle test mode - no data persistence
         elif mode == 'test':
-            logger.warning(f"Gold layer in Test Mode")
+            logger.warning("Gold layer in Test Mode")
             for table_name, df in gold_dfs.items():
                 full_table_name = f"{gold_table}_{table_name}"
                 # Run data quality and validation checks with higher sampling ratio
@@ -664,10 +673,10 @@ def process_batch_gold_layer(spark, silver_table, silver_version=None,
             raise ValueError("Mode must = 'test' or 'write'")
 
     except Exception as e:
-        logger.error(f"Failed to process gold layer: {str(e)}")
+        logger.error("Failed to process gold layer: %s", str(e))
         raise
-    
-    logger.info(f"Gold layer processing completed in {time.time() - start_time:.2f} seconds")
+
+    logger.info("Gold layer processing completed in %.2f seconds", time.time() - start_time)
 
     return gold_dfs
 
@@ -682,12 +691,12 @@ def optimize_table(spark, table, zorder_columns: Optional[List[str]] = None):
     - zorder_columns: Optional list of columns to Z-ORDER by
     """
     logger.info("Starting table optimization")
-    
+
     try:
         # Get statistics before optimization
         file_stats = spark.sql(f"DESCRIBE DETAIL {table}").select("numFiles").first()
         file_count_before = file_stats["numFiles"] if file_stats else "unknown"
-        
+
         # Apply Z-ORDER optimization if columns specified
         if zorder_columns:
             zorder_expr = ", ".join(zorder_columns)
@@ -695,24 +704,25 @@ def optimize_table(spark, table, zorder_columns: Optional[List[str]] = None):
         else:
             # Optimize table without Z-ordering
             spark.sql(f"OPTIMIZE {table}")
-        
+
         # Get statistics after optimization
         file_stats = spark.sql(f"DESCRIBE DETAIL {table}").select("numFiles").first()
         file_count_after = file_stats["numFiles"] if file_stats else "unknown"
-        
+
         # Log results of optimization
-        logger.info(f"Optimized {table}. Files: before={file_count_before}, after={file_count_after}")
-        
-    except Exception as e:
-        logger.warning(f"Failed to optimize {table}: {str(e)}")
+        logger.info("Optimized %s. Files: before=%s, after=%s",
+                   table, file_count_before, file_count_after)
+
+    except RuntimeError as e:
+        logger.warning("Failed to optimize %s: %s", table, str(e))
 
 # Run the full data engineering pipeline
 def run_batch_de_pipeline(spark, source_format, source_path,
-                        bronze_schema, bronze_table=None, silver_table=None, gold_table=None, 
-                        bronze_transform=None, silver_transform=None, gold_transform=None, 
-                        bronze_writer=None, silver_writer=None, gold_writer=None,
-                        bronze_validation_rules=None, silver_validation_rules=None, gold_validation_rules=None,
-                        pipeline_name='DE_Pipeline'):
+                         bronze_schema, bronze_table=None, silver_table=None, gold_table=None,
+                         bronze_transform=None, silver_transform=None, gold_transform=None,
+                         bronze_writer=None, silver_writer=None, gold_writer=None,
+                         bronze_validation_rules=None, silver_validation_rules=None, gold_validation_rules=None,
+                         pipeline_name='DE_Pipeline'):
     """
     Run a bronze, silver, gold batch ETL pipeline
     
@@ -726,7 +736,7 @@ def run_batch_de_pipeline(spark, source_format, source_path,
     - gold_table: Table prefix for gold layer tables
     - bronze_transform: Function to transform bronze DataFrame (takes DataFrame, returns DataFrame)
     - silver_transform: Function to transform silver DataFrame (takes DataFrame, returns DataFrame)
-    - gold_transform: Function to create gold DataFrames (takes DataFrame, returns Dict of DataFrames)
+    - gold_transform:   Function to create gold DataFrames (takes DataFrame, returns Dict)
     - bronze_validation_rules: Validation rules for bronze layer
     - silver_validation_rules: Validation rules for silver layer
     - gold_validation_rules: Validation rules for gold layer
@@ -736,10 +746,10 @@ def run_batch_de_pipeline(spark, source_format, source_path,
     - Dict: Dictionary with pipeline results and metrics
     """
     start_time = time.time()
-    
+
     # Generate a unique pipeline ID with timestamp
     pipeline_id = f"{pipeline_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    
+
     # Initialize pipeline metrics tracking
     pipeline_metrics = {
         "pipeline_id": pipeline_id,
@@ -747,44 +757,46 @@ def run_batch_de_pipeline(spark, source_format, source_path,
         "stages": {},
         "status": "running"
     }
-    
+
     try:
-        logger.info(f"--Starting data pipeline execution with ID: {pipeline_id}--")
-        
+        logger.info("--Starting data pipeline execution with ID: %s--", pipeline_id)
+
         # Process Bronze layer
         bronze_start = time.time()
-        bronzedf, bronze_version = process_batch_bronze_layer(spark, source_format, source_path, bronze_schema, bronze_table, 
-                                                            bronze_transform, bronze_validation_rules, pipeline_id, 
-                                                            'write', bronze_writer)
+        bronzedf, bronze_version = process_batch_bronze_layer(spark, source_format, source_path,
+                                                            bronze_schema, bronze_table,
+                                                            bronze_transform, bronze_validation_rules,
+                                                            pipeline_id, 'write', bronze_writer)
         bronze_duration = time.time() - bronze_start
-        
+
         # Record bronze metrics
         pipeline_metrics["stages"]["bronze"] = {
             "duration_seconds": bronze_duration,
             "version": bronze_version,
             "status": "success"
         }
-        
+
         # Optimize Bronze tables
         optimize_start = time.time()
         optimize_table(spark, bronze_table, zorder_columns=None)
         optimize_duration = time.time() - optimize_start
-        
+
         # Record bronze optimization metrics
         pipeline_metrics["stages"]["bronze_optimize"] = {
             "layer": "bronze",
             "duration_seconds": optimize_duration,
             "status": "success"
         }
-        logger.info(f"--Bronze layer successfully optimized in {optimize_duration:.2f} seconds--")
-        
+        logger.info("--Bronze layer successfully optimized in %.2f seconds--", optimize_duration)
+
         # Process Silver layer
         silver_start = time.time()
-        silverdf, silver_version = process_batch_silver_layer(spark, bronze_table, bronze_version, 
-                                                                silver_table, silver_transform, silver_validation_rules, 
-                                                                pipeline_id, 'write', silver_writer)
+        silverdf, silver_version = process_batch_silver_layer(spark, bronze_table, bronze_version,
+                                                            silver_table, silver_transform,
+                                                            silver_validation_rules, pipeline_id,
+                                                            'write', silver_writer)
         silver_duration = time.time() - silver_start
-        
+
         # Record silver metrics
         pipeline_metrics["stages"]["silver"] = {
             "duration_seconds": silver_duration,
@@ -792,31 +804,31 @@ def run_batch_de_pipeline(spark, source_format, source_path,
             "status": "success",
             "source_bronze_version": bronze_version
         }
-        
+
         # Optimize Silver table with Z-ORDER on common query columns
         optimize_start = time.time()
         optimize_table(spark, silver_table, zorder_columns=['transaction_date', 'transaction_type'])
         optimize_duration = time.time() - optimize_start
-        
+
         # Record silver optimization metrics
         pipeline_metrics["stages"]["silver_optimize"] = {
             "layer": "silver",
             "duration_seconds": optimize_duration,
             "status": "success"
         }
-        logger.info(f"--Silver layer successfully optimized in {optimize_duration:.2f} seconds--")
+        logger.info("--Silver layer successfully optimized in %.2f seconds--", optimize_duration)
 
         # Process Gold layer only if gold_table is specified
         if gold_table:
-        
+
             # Process Gold layer - creates multiple aggregated tables
             gold_start = time.time()
             gold_dfs = process_batch_gold_layer(spark, silver_table, silver_version,
-                                                gold_table, gold_transform, gold_validation_rules,
-                                                pipeline_id, 'write', gold_writer)
+                                              gold_table, gold_transform, gold_validation_rules,
+                                              pipeline_id, 'write', gold_writer)
 
             gold_duration = time.time() - gold_start
-            
+
             # Record gold metrics
             pipeline_metrics["stages"]["gold"] = {
                 "duration_seconds": gold_duration,
@@ -824,33 +836,34 @@ def run_batch_de_pipeline(spark, source_format, source_path,
                 "source_silver_version": silver_version,
                 "tables": list(gold_dfs.keys())
             }
-            
+
             # Optimize all Gold tables
             optimize_start = time.time()
             for table_name in gold_dfs.keys():
                 full_table_name = f"{gold_table}_{table_name}"
                 optimize_table(spark, full_table_name)
             optimize_duration = time.time() - optimize_start
-            
+
             # Record gold optimization metrics
             pipeline_metrics["stages"]["gold_optimize"] = {
                 "layer": "gold",
                 "duration_seconds": optimize_duration,
                 "status": "success"
             }
-            logger.info(f"--Gold layer successfully optimized in {optimize_duration:.2f} seconds--")
-        
+            logger.info("--Gold layer successfully optimized in %.2f seconds--", optimize_duration)
+
         else:
-            logger.info(f"-- Gold layer not defined --")
-        
+            logger.info("-- Gold layer not defined --")
+
         # Record overall pipeline metrics
         total_duration = time.time() - start_time
         pipeline_metrics["end_time"] = datetime.now().isoformat()
         pipeline_metrics["total_duration_seconds"] = total_duration
         pipeline_metrics["status"] = "success"
-        
-        logger.info(f"---Full pipeline execution completed successfully in {total_duration:.2f} seconds---")
-        
+
+        logger.info("---Full pipeline execution completed successfully in %.2f seconds---",
+                    total_duration)
+
         # Return comprehensive pipeline results
         return {
             "status": "success",
@@ -861,20 +874,20 @@ def run_batch_de_pipeline(spark, source_format, source_path,
             "duration_seconds": total_duration,
             "metrics": pipeline_metrics
         }
-        
-    except Exception as e:
+
+    except RuntimeError as e:
         # Handle pipeline failure
         end_time = time.time()
         error_message = str(e)
-        
+
         # Record error information
         pipeline_metrics["end_time"] = datetime.now().isoformat()
         pipeline_metrics["total_duration_seconds"] = end_time - start_time
         pipeline_metrics["status"] = "failed"
         pipeline_metrics["error"] = error_message
-        
-        logger.error(f"Pipeline failed after {end_time - start_time:.2f} seconds: {error_message}")
-        
+
+        logger.error("Pipeline failed after %.2f seconds: %s", end_time - start_time, error_message)
+
         # Return failure information
         return {
             "status": "failed",
