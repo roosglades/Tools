@@ -5,6 +5,7 @@ from typing import List, Optional, Dict, Any
 from datetime import datetime
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql import functions as F
+from pyspark.sql import Window
 from delta.tables import DeltaTable
 from delta import configure_spark_with_delta_pip
 
@@ -268,13 +269,41 @@ def process_batch_bronze_layer(spark, source_format, source_path, schema,
 
     try:
         if mode == 'write':
-            # Execute defined bronze writer function if provided
-            metrics = bronze_writer(bronzedf, bronze_table)
-            
-            logger.info(f"Successfully wrote bronze table: {bronze_table}")
 
+            logger.info(f"Writing to bronze table: {bronze_table}")
+
+            try:
+                # Get version before any changes
+                pre_versions = spark.sql(f"DESCRIBE HISTORY {bronze_table}") \
+                                    .select("version") \
+                                    .orderBy("version", ascending=False) \
+                                    .limit(1) \
+                                    .collect()
+                pre_version = pre_versions[0]["version"] if pre_versions else -1
+            
+            except:
+                pre_version = -1
+
+            # Execute defined bronze writer function if provided
+            bronze_writer(bronzedf, bronze_table)
+
+            # Get only operations after pre_version
+            post_metrics = (
+                spark.sql(f"DESCRIBE HISTORY {bronze_table}")
+                .filter(f"version > {pre_version}")
+                .orderBy("timestamp")
+                .select("operationMetrics")
+                .collect()
+            )
+
+            # Extract operationMetrics as list of dicts
+            metrics = [row["operationMetrics"] for row in post_metrics]
+            
             if metrics:
+                logger.info(f"Successfully wrote to bronze table: {bronze_table}")
                 logger.info(f"Write Metrics: \n{json.dumps(metrics, indent=2)}")
+            else: 
+                logger.info(f"Nothing written to bronze table: {bronze_table}")
             
             # Get current version
             delta_table = DeltaTable.forName(spark, bronze_table)
@@ -389,13 +418,40 @@ def process_batch_silver_layer(spark, bronze_table, bronze_version=None,
 
     try:        
         if mode == 'write':
-            # Write to silver layer
-            metrics = silver_writer(silverdf, silver_table)
+            logger.info(f"Writing to silver table: {silver_table}")
+
+            try:
+                # Get version before any changes
+                pre_versions = spark.sql(f"DESCRIBE HISTORY {silver_table}") \
+                                    .select("version") \
+                                    .orderBy("version", ascending=False) \
+                                    .limit(1) \
+                                    .collect()
+                pre_version = pre_versions[0]["version"] if pre_versions else -1
             
-            logger.info(f"Successfully wrote silver table: {silver_table}")
+            except:
+                pre_version = -1
+
+            # Write to silver layer
+            silver_writer(silverdf, silver_table)
+
+            # Get only operations after pre_version
+            post_metrics = (
+                spark.sql(f"DESCRIBE HISTORY {silver_table}")
+                .filter(f"version > {pre_version}")
+                .orderBy("timestamp")
+                .select("operationMetrics")
+                .collect()
+            )
+
+            # Extract operationMetrics as list of dicts
+            metrics = [row["operationMetrics"] for row in post_metrics]
 
             if metrics:
+                logger.info(f"Successfully wrote to silver table: {silver_table}")
                 logger.info(f"Write Metrics: \n{json.dumps(metrics, indent=2)}")
+            else: 
+                logger.info(f"Nothing written to silver table: {silver_table}")
             
             # Get current version
             delta_table = DeltaTable.forName(spark, silver_table)
@@ -507,12 +563,41 @@ def process_batch_gold_layer(spark, silver_table, silver_version=None,
             # Write each gold table and validate
             for table_name, df in gold_dfs.items():
                 full_table_name = f"{gold_table}_{table_name}"
-                metrics = gold_writer(df, full_table_name)
-                
-                logger.info(f"Successfully wrote gold table: {full_table_name}")
 
+                logger.info(f"Writing to gold table: {full_table_name}")
+
+                try:
+                    # Get version before any changes
+                    pre_versions = spark.sql(f"DESCRIBE HISTORY {full_table_name}") \
+                                        .select("version") \
+                                        .orderBy("version", ascending=False) \
+                                        .limit(1) \
+                                        .collect()
+                    pre_version = pre_versions[0]["version"] if pre_versions else -1
+
+                except:
+                    pre_version = -1
+
+                # Write to gold table
+                gold_writer(df, full_table_name)
+
+                # Get only operations after pre_version
+                post_metrics = (
+                    spark.sql(f"DESCRIBE HISTORY {full_table_name}")
+                    .filter(f"version > {pre_version}")
+                    .orderBy("timestamp")
+                    .select("operationMetrics")
+                    .collect()
+                )
+
+                # Extract operationMetrics as list of dicts
+                metrics = [row["operationMetrics"] for row in post_metrics]
+                
                 if metrics:
+                    logger.info(f"Successfully wrote to gold table: {full_table_name}")
                     logger.info(f"Write Metrics: \n{json.dumps(metrics, indent=2)}")
+                else: 
+                    logger.info(f"Nothing written to gold table: {full_table_name}")
                 
                 # Get current version
                 delta_table = DeltaTable.forName(spark, full_table_name)
