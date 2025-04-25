@@ -305,15 +305,13 @@ def process_batch_bronze_layer(spark, source_format, source_path, schema,
             # For validation, apply transform if needed
             if validation_rules:
                 if bronze_transform:
-                    validation_df = bronze_transform(bronzedf)
-                else:
-                    validation_df = bronzedf
+                    bronzedf = bronze_transform(bronzedf)
                     
-                quality_metrics = check_data_quality(validation_df, "bronze", sample_ratio=0.05)
-                validation_results = validate_dataframe(validation_df, validation_rules, sample_ratio=0.05)
+                quality_metrics = check_data_quality(bronzedf, "bronze", sample_ratio=0.05)
+                validation_results = validate_dataframe(bronzedf, validation_rules, sample_ratio=0.05)
             else:
-                quality_metrics = None
-                validation_results = None
+                quality_metrics     = None
+                validation_results  = None
 
             create_checkpoint(pipeline_id, "bronze", current_version, {
                 "quality_metrics": quality_metrics,
@@ -326,18 +324,17 @@ def process_batch_bronze_layer(spark, source_format, source_path, schema,
             logger.warning("--- Bronze layer in Test Mode ---")
 
             if bronze_transform:
-                test_df = bronze_transform(bronzedf)
+                bronzedf = bronze_transform(bronzedf)
                 logger.info("Transformation function applied in test mode")
             else:
-                test_df = bronzedf
                 logger.info("No transformation function defined")
 
             if validation_rules:
-                quality_metrics = check_data_quality(test_df, "bronze", sample_ratio=0.05)
-                validation_results = validate_dataframe(test_df, validation_rules, sample_ratio=0.05)
+                quality_metrics = check_data_quality(bronzedf, "bronze", sample_ratio=0.05)
+                validation_results = validate_dataframe(bronzedf, validation_rules, sample_ratio=0.05)
             else:
-                quality_metrics = None
-                validation_results = None
+                quality_metrics     = None
+                validation_results  = None
 
             current_version = 'test'
             create_checkpoint(pipeline_id, "bronze", current_version, {
@@ -423,15 +420,15 @@ def process_batch_silver_layer(spark, bronze_table, bronze_version=None,
 
             if validation_rules:
                 if silver_transform:
-                    validation_df = silver_transform(bronzedf)
+                    silverdf = silver_transform(bronzedf)
                 else:
-                    validation_df = bronzedf
+                    silverdf = bronzedf
                 
-                quality_metrics = check_data_quality(validation_df, "silver", sample_ratio=0.05)
-                validation_results = validate_dataframe(validation_df, validation_rules, sample_ratio=0.05)
+                quality_metrics = check_data_quality(silverdf, "silver", sample_ratio=0.05)
+                validation_results = validate_dataframe(silverdf, validation_rules, sample_ratio=0.05)
             else:
-                quality_metrics = None
-                validation_results = None
+                quality_metrics     = None
+                validation_results  = None
 
             create_checkpoint(pipeline_id, "silver", current_version, {
                 "quality_metrics": quality_metrics,
@@ -444,15 +441,14 @@ def process_batch_silver_layer(spark, bronze_table, bronze_version=None,
             logger.warning("--- Silver layer in Test Mode ---")
 
             if silver_transform:
-                test_df = silver_transform(bronzedf)
+                silver = silver_transform(bronzedf)
                 logger.info("Transformation function applied in test mode")
             else:
-                test_df = bronzedf
                 logger.info("No transformation function defined")
 
             if validation_rules:
-                quality_metrics = check_data_quality(test_df, "silver", sample_ratio=0.05)
-                validation_results = validate_dataframe(test_df, validation_rules, sample_ratio=0.05)
+                quality_metrics = check_data_quality(silverdf, "silver", sample_ratio=0.05)
+                validation_results = validate_dataframe(silverdf, validation_rules, sample_ratio=0.05)
             else:
                 quality_metrics = None
                 validation_results = None
@@ -472,7 +468,7 @@ def process_batch_silver_layer(spark, bronze_table, bronze_version=None,
         raise
 
     logger.info("Silver layer processing completed in %.2f seconds", time.time() - start_time)
-    return bronzedf, current_version
+    return silverdf, current_version
 
 # Process gold layer
 def process_batch_gold_layer(spark, silver_table, silver_version=None,
